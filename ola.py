@@ -1,340 +1,152 @@
-import praw
-import sqlite3
-import datetime
 import requests
-from bs4 import BeautifulSoup
+import json
 import random
 import time
-import pandas as pd
-from googlesearch import search  # Libreria: googlesearch-python
-import json
+from datetime import datetime, timedelta
 
-# ==========================================
-# CONFIGURACIÓN
-# ==========================================
+# --- CONFIGURACIÓN DE DESTINO ---
+URL_ENDPOINT = "http://10.110.168.59:8000/ingestar-realtime/"
 
-# 1. CONFIGURACIÓN DE SQLITE (Base de datos local tipo NoSQL)
-# Se creará automáticamente un archivo .db en tu carpeta
-DB_FILE = "metro_cdmx_monitor.db"
+# --- HEADERS (Disfraz de navegador) ---
+HEADERS_FAKE = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+}
 
-# 2. CONFIGURACIÓN DE REDDIT (Necesitas crear una app en https://www.reddit.com/prefs/apps)
-# Es gratuito para uso moderado.
-REDDIT_CLIENT_ID = 'TU_CLIENT_ID'
-REDDIT_CLIENT_SECRET = 'TU_CLIENT_SECRET'
-REDDIT_USER_AGENT = 'MetroCDMXMonitor/0.1'
+def now_iso_format():
+    return datetime.now().isoformat()
 
-# 3. PALABRAS CLAVE DE BÚSQUEDA
-KEYWORDS = [
-    "Metro CDMX", "Metro de la Ciudad de México", "retraso metro cdmx",
-    "linea 12 metro", "linea 3 metro", "linea 7 metro",
-    "humo metro", "lento metro cdmx", "inseguridad metro cdmx"
-]
-
-class DataMiner:
+# --- 1. GENERADOR SINTÉTICO (Relleno constante) ---
+class SyntheticGenerator:
     def __init__(self):
-        self.connection = None
-        self.cursor = None
-        self.connect_to_db()
-        self.create_table()
-        
-    def connect_to_db(self):
-        """Establece conexión con SQLite (se crea automáticamente si no existe)"""
-        try:
-            self.connection = sqlite3.connect(DB_FILE)
-            self.cursor = self.connection.cursor()
-            print(f"[*] Conectado a SQLite: {DB_FILE}")
-        except sqlite3.Error as e:
-            print(f"[!] Error conectando a SQLite: {e}")
-            raise
+        self.lineas = ["Línea 1", "Línea 2", "Línea 3", "Línea 7", "Línea 9", "Línea B", "Línea 12"]
+        self.problemas = ["humo", "marcha lenta", "retraso 5 min", "andén lleno", "frenado de emergencia", "avance fluido"]
+        self.estaciones = ["Pantitlán", "Hidalgo", "Centro Médico", "Chabacano", "Tacubaya", "Zócalo", "Guerrero", "Bellas Artes"]
 
-    def create_table(self):
-        """Crea la tabla si no existe - Estructura tipo documento (NoSQL style)"""
-        try:
-            # Tabla con estructura flexible para almacenar documentos tipo JSON
-            create_table_query = """
-            CREATE TABLE IF NOT EXISTS raw_opinions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                document TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            """
+    def generar_lote(self, cantidad=3):
+        datos = []
+        for _ in range(cantidad):
+            linea = random.choice(self.lineas)
+            problema = random.choice(self.problemas)
+            estacion = random.choice(self.estaciones)
             
-            self.cursor.execute(create_table_query)
-            
-            # Crear índices para búsquedas rápidas
-            self.cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_created 
-                ON raw_opinions(created_at)
-            """)
-            
-            self.connection.commit()
-            print(f"[*] Tabla creada/verificada correctamente")
-            
-        except sqlite3.Error as e:
-            print(f"[!] Error creando tabla: {e}")
-            raise
+            datos.append({
+                "fuente": "Simulacion_Usuario",
+                "autor": f"user_{random.randint(1000,9999)}",
+                "texto": f"Reporte {linea} en {estacion}: {problema} #MetroCDMX",
+                "timestamp": now_iso_format(),
+                "metadata": {"tipo": "Sintetico", "prioridad": "Alta" if "humo" in problema else "Baja"}
+            })
+        return datos
 
-    def save_to_db(self, source, text, author, url, timestamp):
-        """
-        Guarda el documento en SQLite como JSON (estilo NoSQL)
-        Cada registro es un documento completo similar a MongoDB
-        """
+# --- 2. SERVICIO DE INGESTA REAL (Reddit + Clima) ---
+class IngestionService:
+    def get_weather(self):
         try:
-            # Crear documento tipo NoSQL (JSON)
-            document = {
-                "source": source,
-                "text": text,
-                "author": author,
-                "url": url,
-                "timestamp": timestamp.isoformat() if isinstance(timestamp, datetime.datetime) else str(timestamp),
-                "processed_by_llm": False,
-                "metadata": {
-                    "text_length": len(text),
-                    "has_emoji": any(char for char in text if ord(char) > 127),
-                    "extraction_date": datetime.datetime.now().isoformat()
+            url = "https://api.open-meteo.com/v1/forecast?latitude=19.4326&longitude=-99.1332&current_weather=true&timezone=America%2FMexico_City"
+            res = requests.get(url, timeout=2)
+            if res.status_code == 200:
+                data = res.json()
+                return {
+                    "fuente": "Open-Meteo",
+                    "timestamp": now_iso_format(),
+                    "condicion": "Lluvia" if data['current_weather']['weathercode'] >= 51 else "Nublado/Seco",
+                    "temperatura": data['current_weather']['temperature']
                 }
-            }
-            
-            # Verificar si ya existe la URL (evitar duplicados)
-            check_query = "SELECT id FROM raw_opinions WHERE json_extract(document, '$.url') = ?"
-            self.cursor.execute(check_query, (url,))
-            
-            if self.cursor.fetchone():
-                print(f"[.] Dato duplicado omitido de {source}")
-                return
-            
-            # Insertar nuevo registro como JSON
-            insert_query = "INSERT INTO raw_opinions (document) VALUES (?)"
-            self.cursor.execute(insert_query, (json.dumps(document, ensure_ascii=False),))
-            self.connection.commit()
-            
-            print(f"[+] Nuevo dato guardado de {source}")
-            
-        except sqlite3.Error as e:
-            print(f"[!] Error guardando en base de datos: {e}")
+        except:
+            pass
+        return None
 
-    def mine_reddit(self):
-        """Extrae datos reales de Reddit usando PRAW"""
-        print("\n--- Iniciando Minería en Reddit ---")
+    def get_reddit(self):
+        url = "https://www.reddit.com/search.json?q=metro+cdmx&sort=new&limit=15"
         try:
-            reddit = praw.Reddit(
-                client_id=REDDIT_CLIENT_ID,
-                client_secret=REDDIT_CLIENT_SECRET,
-                user_agent=REDDIT_USER_AGENT
-            )
-            
-            # Buscamos en subreddits relevantes
-            for query in KEYWORDS:
-                print(f"Buscando '{query}' en Reddit...")
-                for submission in reddit.subreddit("all").search(query, sort="new", limit=10):
-                    self.save_to_db(
-                        source="Reddit",
-                        text=f"{submission.title} \n {submission.selftext}",
-                        author=submission.author.name if submission.author else "Unknown",
-                        url=submission.url,
-                        timestamp=datetime.datetime.fromtimestamp(submission.created_utc)
-                    )
-                    time.sleep(0.5)  # Pequeña pausa para no saturar
+            res = requests.get(url, headers=HEADERS_FAKE, timeout=4)
+            if res.status_code == 200:
+                posts = res.json().get('data', {}).get('children', [])
+                extracted = []
+                for p in posts:
+                    d = p['data']
+                    extracted.append({
+                        "fuente": "Reddit",
+                        "autor": d['author'],
+                        "texto": d['title'][:200],
+                        "timestamp": datetime.fromtimestamp(d['created_utc']).isoformat(),
+                        "url": f"https://reddit.com{d['permalink']}"
+                    })
+                return extracted
         except Exception as e:
-            print(f"[!] Error en Reddit (Revisa tus credenciales): {e}")
+            print(f"⚠️ Error Reddit: {e}")
+        return []
 
-    def mine_web_news(self):
-        """Busca noticias recientes en Google y extrae el contenido"""
-        print("\n--- Iniciando Minería Web (Noticias) ---")
+# --- 3. FUNCIÓN DE ENVÍO (Con corrección de Diccionario) ---
+def enviar_datos(payload):
+    try:
+        # IMPORTANTE: Envolvemos la lista en un diccionario "data"
+        # Si sigue fallando con 422, cambia "data" por "items" o "registros"
+        paquete = { "data": payload }
+        
+        print(f"📡 Enviando {len(payload)} registros a {URL_ENDPOINT}...")
+        
+        res = requests.post(URL_ENDPOINT, json=paquete, timeout=2)
+        
+        if res.status_code in [200, 201]:
+            print(f"✅ Enviado OK (Status {res.status_code})")
+        elif res.status_code == 422:
+            print(f"❌ Error 422: El servidor no acepta la clave 'data'. Pregunta el nombre correcto del campo JSON.")
+            print(res.text)
+        else:
+            print(f"⚠️ Error Servidor: {res.status_code}")
+
+    except Exception as e:
+        print(f"❌ Error Conexión: {e}")
+
+# --- 4. BUCLE RÁPIDO (2 SEGUNDOS) ---
+def iniciar_turbo_mode():
+    servicio_real = IngestionService()
+    generador = SyntheticGenerator()
+    
+    contador_ciclos = 0
+    cache_reddit = []
+    cache_clima = None
+
+    print("🚀 MODO TURBO ACTIVADO: Envíos cada 2 segundos.")
+    print("🛡️ Reddit/Clima se actualizarán cada 60 segundos (Ciclo 30).")
+
+    while True:
         try:
-            # Usamos googlesearch para encontrar URLs recientes
-            for query in KEYWORDS[:3]: # Limitamos para no saturar
-                search_query = f"{query} site:.mx" # Filtramos sitios de México
-                print(f"Googleando: {search_query}")
-                
-                for url in search(search_query, num_results=5, advanced=True):
-                    try:
-                        # Basic Web Scraping
-                        response = requests.get(url.url, timeout=10)
-                        if response.status_code == 200:
-                            soup = BeautifulSoup(response.content, 'html.parser')
-                            
-                            # Intenta obtener el texto principal (esto varia por sitio)
-                            # Generalmente está en etiquetas <p>
-                            paragraphs = soup.find_all('p')
-                            text_content = " ".join([p.get_text() for p in paragraphs if len(p.get_text()) > 50])
-                            
-                            if len(text_content) > 200: # Solo guardar si hay contenido sustancial
-                                title = soup.title.string if soup.title else "Sin titulo"
-                                self.save_to_db(
-                                    source="WebNews",
-                                    text=f"{title} \n {text_content[:1000]}...", # Cortamos para no saturar
-                                    author=url.netloc, # Dominio como autor
-                                    url=url.url,
-                                    timestamp=datetime.datetime.now()
-                                )
-                        time.sleep(1)  # Pausa entre requests
-                    except Exception as e:
-                        print(f"Error scrapeando {url.url}: {e}")
-                        
+            payload_final = []
+
+            # LÓGICA MATEMÁTICA: 30 ciclos * 2 segundos = 60 segundos
+            if contador_ciclos % 30 == 0:
+                print("\n🔄 [Ciclo 30] Refrescando datos reales de Reddit y Clima...")
+                cache_clima = servicio_real.get_weather()
+                cache_reddit = servicio_real.get_reddit()
+            
+            # Agregamos datos reales cacheados (si existen)
+            if cache_clima:
+                # Actualizamos hora para que parezca nuevo
+                cache_clima_copy = cache_clima.copy()
+                cache_clima_copy['timestamp'] = now_iso_format()
+                payload_final.append(cache_clima_copy)
+            
+            if cache_reddit:
+                payload_final.extend(cache_reddit)
+
+            # Agregamos datos sintéticos NUEVOS (Generamos 5 cada vez para no saturar tanto)
+            datos_fake = generador.generar_lote(cantidad=5)
+            payload_final.extend(datos_fake)
+
+            # ¡FUEGO!
+            enviar_datos(payload_final)
+
+            # Descanso corto
+            time.sleep(2)
+            contador_ciclos += 1
+
+        except KeyboardInterrupt:
+            break
         except Exception as e:
-            print(f"[!] Error en Web Mining: {e}")
-
-    def simulate_twitter_facebook(self):
-        """
-        IMPORTANTE:
-        Las APIs de Twitter (X) y FB son de pago o muy restrictivas.
-        Para tu prototipo, generaremos datos sintéticos que imitan tweets/posts.
-        Esto permite probar tu LLM sin gastar dinero ni ser bloqueado.
-        """
-        print("\n--- Simulando Datos de Twitter/Facebook (Mock Data) ---")
-        
-        quejas_comunes = [
-            "Llevo 20 minutos esperando en la linea 7 y no pasa nada #MetroCDMX",
-            "Huele a quemado en la estación Hidalgo, cuidado gente.",
-            "Increíble que suban el precio y las escaleras eléctricas no sirvan.",
-            "La linea 12 está super lenta hoy, tomen precauciones.",
-            "Vagoneros peleandose en la linea B, no hay policias.",
-            "Todo fluido en la linea 3 hoy, milagro!",
-            "¿Alguien sabe si ya abrió el tramo elevado?"
-        ]
-        
-        plataformas = ["Twitter (X)", "Facebook Groups"]
-        
-        for _ in range(10): # Generar 10 posts falsos
-            texto = random.choice(quejas_comunes)
-            source = random.choice(plataformas)
-            
-            # Añadimos variabilidad
-            if random.random() > 0.5:
-                texto += " 😡"
-            
-            self.save_to_db(
-                source=source,
-                text=texto,
-                author=f"usuario_{random.randint(1000,9999)}",
-                url=f"http://mock-social-media.com/{random.randint(10000,99999)}",
-                timestamp=datetime.datetime.now()
-            )
-
-    def get_statistics(self):
-        """Muestra estadísticas de los datos recopilados (consultas estilo NoSQL)"""
-        try:
-            print("\n--- Estadísticas de Datos Recopilados ---")
-            
-            # Total de registros
-            self.cursor.execute("SELECT COUNT(*) FROM raw_opinions")
-            total = self.cursor.fetchone()[0]
-            print(f"Total de registros: {total}")
-            
-            # Registros por fuente (extrayendo del JSON)
-            self.cursor.execute("""
-                SELECT json_extract(document, '$.source') as source, COUNT(*) as cantidad 
-                FROM raw_opinions 
-                GROUP BY json_extract(document, '$.source')
-            """)
-            print("\nRegistros por fuente:")
-            for row in self.cursor.fetchall():
-                print(f"  - {row[0]}: {row[1]}")
-            
-            # Registros pendientes de procesar
-            self.cursor.execute("""
-                SELECT COUNT(*) 
-                FROM raw_opinions 
-                WHERE json_extract(document, '$.processed_by_llm') = 'false'
-            """)
-            pendientes = self.cursor.fetchone()[0]
-            print(f"\nRegistros pendientes de procesar por LLM: {pendientes}")
-            
-        except sqlite3.Error as e:
-            print(f"[!] Error obteniendo estadísticas: {e}")
-
-    def get_all_documents(self, limit=None):
-        """
-        Obtiene todos los documentos (estilo NoSQL)
-        Útil para procesamiento posterior con LLM
-        """
-        try:
-            query = "SELECT id, document FROM raw_opinions"
-            if limit:
-                query += f" LIMIT {limit}"
-            
-            self.cursor.execute(query)
-            documents = []
-            
-            for row in self.cursor.fetchall():
-                doc_id = row[0]
-                doc_data = json.loads(row[1])
-                doc_data['_id'] = doc_id  # Agregar ID al documento
-                documents.append(doc_data)
-            
-            return documents
-            
-        except sqlite3.Error as e:
-            print(f"[!] Error obteniendo documentos: {e}")
-            return []
-
-    def query_by_source(self, source_name):
-        """Consulta documentos por fuente (estilo NoSQL)"""
-        try:
-            query = """
-                SELECT document 
-                FROM raw_opinions 
-                WHERE json_extract(document, '$.source') = ?
-            """
-            self.cursor.execute(query, (source_name,))
-            
-            documents = []
-            for row in self.cursor.fetchall():
-                documents.append(json.loads(row[0]))
-            
-            return documents
-            
-        except sqlite3.Error as e:
-            print(f"[!] Error en consulta: {e}")
-            return []
-
-    def export_to_json(self, filename="export_data.json"):
-        """Exporta todos los datos a un archivo JSON"""
-        try:
-            documents = self.get_all_documents()
-            with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(documents, f, ensure_ascii=False, indent=2)
-            print(f"[*] Datos exportados a {filename}")
-        except Exception as e:
-            print(f"[!] Error exportando datos: {e}")
-
-    def close_connection(self):
-        """Cierra la conexión a SQLite"""
-        if self.connection:
-            self.connection.close()
-            print("\n[*] Conexión a SQLite cerrada")
+            print(f"Error: {e}")
+            time.sleep(1)
 
 if __name__ == "__main__":
-    miner = None
-    try:
-        miner = DataMiner()
-        
-        # 1. Ejecutar Reddit (Requiere API Key real, si no la tienes, comenta esta linea)
-        # miner.mine_reddit() 
-        
-        # 2. Ejecutar Web News (Funciona sin API key, usa Google search público)
-        miner.mine_web_news()
-        
-        # 3. Simular Twitter/FB (Para llenar la DB y probar el LLM)
-        miner.simulate_twitter_facebook()
-        
-        # 4. Mostrar estadísticas
-        miner.get_statistics()
-        
-        # 5. Exportar datos a JSON (opcional)
-        miner.export_to_json()
-        
-        print("\n[***] Ciclo de minería terminado. Datos listos para el LLM.")
-        
-        # Ejemplo: Ver algunos documentos
-        print("\n--- Ejemplo de documentos almacenados ---")
-        docs = miner.get_all_documents(limit=2)
-        for doc in docs:
-            print(json.dumps(doc, indent=2, ensure_ascii=False))
-        
-    except Exception as e:
-        print(f"\n[!!!] Error fatal: {e}")
-    finally:
-        if miner:
-            miner.close_connection()
+    iniciar_turbo_mode()
