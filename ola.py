@@ -43,7 +43,7 @@ class IngestionService:
     def get_weather(self):
         try:
             url = "https://api.open-meteo.com/v1/forecast?latitude=19.4326&longitude=-99.1332&current_weather=true&timezone=America%2FMexico_City"
-            res = requests.get(url, timeout=2)
+            res = requests.get(url, timeout=10)
             if res.status_code == 200:
                 data = res.json()
                 return {
